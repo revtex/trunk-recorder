@@ -663,6 +663,75 @@ namespace
         return false;
     }
 
+    // Render the "why was this upload rejected?" string used in worker
+    // log lines. Prefers structured info from OpenScanner's error envelope
+    //   {"error":{"code":"duplicate_call","message":"...","details":{...}}}
+    // and falls back to a short description of well-known HTTP statuses
+    // when no envelope is present.
+    std::string describe_failure(long status, const std::string &body)
+    {
+        std::string code, message;
+        try
+        {
+            auto j = nlohmann::json::parse(body, nullptr, false);
+            if (j.is_object() && j.contains("error") &&
+                j["error"].is_object())
+            {
+                const auto &e = j["error"];
+                if (e.contains("code") && e["code"].is_string())
+                    code = e["code"].get<std::string>();
+                if (e.contains("message") && e["message"].is_string())
+                    message = e["message"].get<std::string>();
+            }
+        }
+        catch (...)
+        {
+            // fall through to status-code defaults
+        }
+
+        std::ostringstream out;
+        out << "HTTP " << status;
+        switch (status)
+        {
+        case 400:
+            out << " bad request";
+            break;
+        case 401:
+            out << " unauthorized (check apiKey)";
+            break;
+        case 403:
+            out << " forbidden (apiKey lacks access to system)";
+            break;
+        case 404:
+            out << " not found (check server URL)";
+            break;
+        case 409:
+            out << " duplicate call (already accepted)";
+            break;
+        case 413:
+            out << " payload too large";
+            break;
+        case 415:
+            out << " unsupported audio format";
+            break;
+        case 422:
+            out << " call rejected by validation";
+            break;
+        case 429:
+            out << " rate limited";
+            break;
+        default:
+            if (status >= 500 && status < 600)
+                out << " server error";
+            break;
+        }
+        if (!code.empty())
+            out << " [" << code << "]";
+        if (!message.empty())
+            out << ": " << message;
+        return out.str();
+    }
+
     std::chrono::milliseconds backoff_for_attempt(unsigned attempt_index)
     {
         std::int64_t delay = kBackoffBase.count();
@@ -814,10 +883,11 @@ namespace
 
     private:
         bool perform_upload(const UploadJob &job, std::string *error_out,
-                            long *status_out)
+                            long *status_out, std::string *body_out)
         {
             *error_out = {};
             *status_out = 0;
+            *body_out = {};
 
             if (curl_ == nullptr)
             {
@@ -939,6 +1009,8 @@ namespace
             curl_slist_free_all(headerlist);
             curl_mime_free(mime);
 
+            *body_out = std::move(response_body);
+
             if (network_error)
                 return false;
             return *status_out >= 200 && *status_out < 300;
@@ -966,10 +1038,11 @@ namespace
                 {
                     std::string err;
                     long status = 0;
+                    std::string body;
                     bool ok = false;
                     try
                     {
-                        ok = perform_upload(job, &err, &status);
+                        ok = perform_upload(job, &err, &status, &body);
                     }
                     catch (const std::exception &ex)
                     {
@@ -1003,34 +1076,26 @@ namespace
                     const bool network_error = !err.empty();
                     const bool retriable = is_retriable(status, network_error);
                     const bool last_attempt = (attempt + 1 >= attempts);
+                    const std::string reason =
+                        network_error ? err : describe_failure(status, body);
 
                     if (!retriable)
                     {
                         BOOST_LOG_TRIVIAL(error)
                             << job.log_prefix
-                            << "OpenScanner Upload rejected (HTTP "
-                            << status << "); not retrying";
+                            << "OpenScanner Upload rejected: " << reason
+                            << "; not retrying";
                         break;
                     }
 
                     if (last_attempt)
                     {
-                        if (network_error)
-                        {
-                            BOOST_LOG_TRIVIAL(error)
-                                << job.log_prefix
-                                << "OpenScanner Upload failed after "
-                                << attempts
-                                << " attempts (network error: " << err << ")";
-                        }
-                        else
-                        {
-                            BOOST_LOG_TRIVIAL(error)
-                                << job.log_prefix
-                                << "OpenScanner Upload failed after "
-                                << attempts << " attempts (HTTP " << status
-                                << ")";
-                        }
+                        BOOST_LOG_TRIVIAL(error)
+                            << job.log_prefix
+                            << "OpenScanner Upload failed after " << attempts
+                            << " attempts ("
+                            << (network_error ? "network error: " : "")
+                            << reason << ")";
                         break;
                     }
 
@@ -1039,8 +1104,7 @@ namespace
                         << job.log_prefix
                         << "OpenScanner Upload attempt "
                         << (attempt + 1) << "/" << attempts << " failed ("
-                        << (network_error ? err
-                                          : "HTTP " + std::to_string(status))
+                        << reason
                         << "); retrying in " << delay.count() << " ms";
 
                     // Sleep through the backoff unconditionally; stop()
@@ -1095,17 +1159,17 @@ namespace squelch
             config_ = std::move(*parsed);
 
             // Match the bundled openmhz / rdioscanner / broadcastify
-            // uploaders' parse_config() output: one "<plugin> Server: <url>"
-            // line followed by one "Uploading calls for: <short>\t<plugin>
-            // System: <id>\t API Key: ******xx" line per configured system.
+            // uploaders' parse_config() output. The API key is configured
+            // once at the plugin level (not per-system), so emit it on the
+            // server line and just list the systems below.
             BOOST_LOG_TRIVIAL(info)
-                << kLogPrefix << "OpenScanner Server: " << config_.server;
+                << kLogPrefix << "OpenScanner Server: " << config_.server
+                << "\t API Key: " << ::redact(config_.api_key);
             for (const auto &sys : config_.systems)
             {
                 BOOST_LOG_TRIVIAL(info)
                     << kLogPrefix << "Uploading calls for: " << sys.short_name
-                    << "\t OpenScanner System: " << sys.system_id
-                    << "\t API Key: " << ::redact(config_.api_key);
+                    << "\t OpenScanner System: " << sys.system_id;
             }
             if (config_.systems.empty())
             {
