@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// squelch_uploader.cc — Trunk-Recorder Plugin_Api subclass for Squelch.
+// squelch_uploader.cc — TR plugin that uploads completed calls to
+// OpenScanner over HTTPS. Single translation unit modeled on TR's
+// bundled uploaders. Contains:
 //
-// Single translation unit, modelled on TR's bundled uploaders under
-// `trunk-recorder/plugins/`. Everything lives here:
+//   * config parsing (server / apiKey / maxRetries / systems[])
+//   * libcurl multipart POST to <server>/api/v1/calls
+//   * 50 MiB pre-flight check on the audio file
+//   * background upload thread with retry + backoff
+//   * Plugin_Api subclass and BOOST_DLL_ALIAS export
 //
-//   * `parse_config` (validation of server / apiKey / maxRetries plus the
-//     `systems[]` array of { systemId, shortName, unitTagsFile? } entries)
-//   * the libcurl multipart POST to `<server>/api/v1/calls`
-//   * RFC 3339 / JSON / 50 MiB pre-flight projection of TR's `Call_Data_t`
-//   * a single background upload thread with retry+backoff
-//   * the `Plugin_Api` subclass and the `BOOST_DLL_ALIAS(create_plugin)`
-//     factory TR's plugin loader looks for
-//
-// All non-public symbols sit in an anonymous namespace; only
-// `squelch::SquelchUploader::create` crosses the ABI boundary (via
-// `BOOST_DLL_ALIAS`).
+// Internals live in an anonymous namespace; only `create_plugin`
+// crosses the ABI boundary.
 
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
 #include "../../trunk-recorder/formatter.h"
@@ -58,70 +54,40 @@ namespace squelch
 namespace
 {
 
-    // ---------------------------------------------------------------------
-    // Plugin identity
-    // ---------------------------------------------------------------------
-
     constexpr const char *kPluginName = "squelch_uploader";
     constexpr const char *kPluginVersion = "0.2.2";
-
-    // Plugin-level log prefix used for lifecycle and config messages
-    // (init / parse_config / start / stop) that don't have a per-call
-    // context. Mirrors the bundled openmhz / rdioscanner uploaders'
-    // "\t[OpenMHz]\t" / "\t[Rdio Scanner]\t" style so the openscanner
-    // plugin slots into TR's log stream the same way.
     constexpr const char *kLogPrefix = "\t[OpenScanner]\t";
-
-    // Squelch v1's upload-route ceiling. Files larger than this are rejected
-    // before opening a connection.
     constexpr std::size_t kMaxUploadBytes = 50ULL * 1024ULL * 1024ULL;
 
-    // ---------------------------------------------------------------------
-    // Parsed plugin configuration
-    //
-    // Every plugin entry uses a `systems[]` array so a single instance can
-    // fan out to one or more TR systems served by the same Squelch host:
+    // Plugin config. One instance can fan out to multiple TR systems on
+    // the same OpenScanner host. Calls are routed by matching shortName;
+    // calls for unlisted systems are dropped.
     //
     //   {
-    //     "name":       "squelch_uploader",
-    //     "library":    "/usr/lib/trunk-recorder/plugins/squelch_uploader.so",
     //     "server":     "https://squelch.example.com",
     //     "apiKey":     "sk_live_…",
     //     "maxRetries": 3,
     //     "systems": [
-    //       {
-    //         "systemId": 1,
-    //         "shortName": "MARCSLake",
-    //         "unitTagsFile": "/etc/trunk-recorder/marcslake.csv"
-    //       },
-    //       { "systemId": 2, "shortName": "MARCSCuy" },
-    //       { "systemId": 3, "shortName": "MARCSGea" }
+    //       { "systemId": 1, "shortName": "MARCSLake" },
+    //       { "systemId": 2, "shortName": "MARCSCuy" }
     //     ]
     //   }
-    //
-    // Each completed call is routed to the matching entry by TR's
-    // `call_info.short_name`; calls whose short_name is not listed are
-    // dropped (logged at debug level) rather than uploaded. shortName
-    // values must be unique within `systems[]`.
-    // ---------------------------------------------------------------------
 
     struct SystemEntry
     {
-        long system_id = 0;         // required, positive (JSON "systemId")
-        std::string short_name;     // required + unique (JSON "shortName")
-        std::string unit_tags_file; // optional (JSON "unitTagsFile")
+        long system_id = 0;         // required, positive
+        std::string short_name;     // required, unique
+        std::string unit_tags_file; // optional
     };
 
     struct PluginConfig
     {
         std::string server;  // required, http(s) URL
-        std::string api_key; // required, non-empty (JSON "apiKey")
-
-        // One entry per `systems[]` element. Always non-empty on success.
+        std::string api_key; // required, non-empty
         std::vector<SystemEntry> systems;
 
-        // Maximum retry attempts on transient failure (HTTP 408, 429, 5xx,
-        // network errors). 0 disables retry; bounds 0..10.
+        // Retry attempts on transient failure (HTTP 408, 429, 5xx,
+        // network errors). 0 disables retry. Range: 0..10.
         unsigned max_retries = 3;
     };
 
@@ -141,9 +107,8 @@ namespace
         return true;
     }
 
-    // Parses `data` into a PluginConfig. Returns std::nullopt and writes a
-    // human-readable reason into *error on validation failure. *error is
-    // untouched on success.
+    // Parse `data` into a PluginConfig. Returns nullopt with *error set
+    // on validation failure. *error is untouched on success.
     std::optional<PluginConfig> parse_plugin_config(const nlohmann::json &data,
                                                     std::string *error)
     {
@@ -202,9 +167,8 @@ namespace
             }
         }
 
-        // systems[] — required, non-empty array of routing entries. Top-
-        // level systemId / shortName / unitTagsFile are not accepted; each
-        // entry must carry its own.
+        // systems[] — required, non-empty array. Top-level systemId /
+        // shortName / unitTagsFile are not accepted.
         {
             const auto systems_it = data.find("systems");
             if (systems_it == data.end() || systems_it->is_null())
@@ -282,8 +246,7 @@ namespace
                     }
                 }
 
-                // shortName — required and used as the routing key, so it
-                // must be non-empty and unique within the array.
+                // shortName — required, non-empty, unique in systems[].
                 {
                     auto sn = el.find("shortName");
                     if (sn == el.end() || !sn->is_string())
@@ -355,7 +318,7 @@ namespace
     }
 
     // ---------------------------------------------------------------------
-    // TR-free projection of the per-call fields Squelch consumes.
+    // Per-call data and helpers
     // ---------------------------------------------------------------------
 
     struct CallSourceLite
@@ -382,9 +345,9 @@ namespace
     struct UploadJob
     {
         long talkgroup = 0;
-        long start_time = 0; // epoch seconds (from TR's `start_time`)
+        long start_time = 0;
         double freq = 0.0;
-        double length = 0.0; // seconds
+        double length = 0.0;
         long error_count = 0;
         long spike_count = 0;
 
@@ -394,7 +357,7 @@ namespace
         std::string talkgroup_group;
 
         std::string audio_path;
-        std::string short_name; // becomes `systemLabel`
+        std::string short_name;
 
         std::vector<CallSourceLite> transmission_source_list;
         std::vector<CallFreqLite> transmission_error_list;
@@ -402,27 +365,19 @@ namespace
 
         long system_id = 0;
 
-        // File size (bytes) captured at preflight; included in the success
-        // log line to match the bundled openmhz / rdioscanner format.
         std::uintmax_t audio_bytes = 0;
 
-        // Pre-rendered "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t" prefix
-        // matching TR's `log_header()` so our log lines line up with the
-        // bundled openmhz / rdioscanner / broadcastify uploaders.
+        // Pre-rendered TR log_header() prefix:
+        //   "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t"
         std::string log_prefix;
     };
-
-    // ---------------------------------------------------------------------
-    // Wire helpers
-    // ---------------------------------------------------------------------
 
     constexpr std::chrono::milliseconds kBackoffBase{1000};
     constexpr std::chrono::milliseconds kBackoffCap{30000};
     constexpr double kJitterRatio = 0.20;
 
-    // Render an API key the way TR's bundled uploaders do: six asterisks
-    // followed by the last two characters (e.g. "******29"). Returns all
-    // asterisks if the key is too short to safely reveal a tail.
+    // Render an API key as "******xx" (last two chars). All asterisks
+    // if the key is too short.
     std::string redact(const std::string &key)
     {
         if (key.size() <= 2)
@@ -438,11 +393,7 @@ namespace
         return s;
     }
 
-    // Map an audio-file extension (case-insensitive) to its MIME type.
-    // Trunk-Recorder only ever hands us a `.wav` (raw recording) or a
-    // `.m4a` (when `compress_wav` is enabled), so those are the only
-    // cases we recognise. Anything else falls back to a generic
-    // `application/octet-stream` rather than guessing.
+    // TR only ever produces .wav (raw) or .m4a (when compress_wav is on).
     std::string audio_content_type_for(const std::string &path)
     {
         const auto dot = path.find_last_of('.');
@@ -456,7 +407,7 @@ namespace
         return "application/octet-stream";
     }
 
-    // RFC 3339 UTC: `YYYY-MM-DDTHH:MM:SSZ`.
+    // RFC 3339 UTC timestamp: "YYYY-MM-DDTHH:MM:SSZ".
     std::string to_rfc3339_utc(std::time_t epoch_s)
     {
         std::tm tm_utc{};
@@ -470,7 +421,7 @@ namespace
         return std::string(buf, n);
     }
 
-    // RFC 8259 §7 string escaping. `/` is left unescaped (legal either way).
+    // RFC 8259 string escaping.
     void json_escape_into(const std::string &s, std::ostringstream &out)
     {
         out.put('"');
@@ -561,7 +512,7 @@ namespace
             const auto &f = items[i];
             if (i != 0)
                 out << ',';
-            // freq rounded to integer Hz; pos/len keep two decimals.
+            // freq as integer Hz; pos/len keep two decimals.
             const std::int64_t freq_hz =
                 static_cast<std::int64_t>(std::llround(f.freq));
             out << "{\"freq\":" << freq_hz
@@ -576,8 +527,7 @@ namespace
         return out.str();
     }
 
-    // The TR convention is that a single-entry list (the talkgroup itself)
-    // means "not patched"; only emit the array when there's more than one.
+    // TR convention: a single-entry list means "not patched".
     std::string build_patches_json(const std::vector<unsigned long> &items)
     {
         if (items.size() <= 1)
@@ -594,7 +544,7 @@ namespace
         return out.str();
     }
 
-    // First non-zero source id from transmission_source_list.
+    // First non-zero source id from the source list.
     std::optional<std::int64_t>
     first_unit_id(const std::vector<CallSourceLite> &sources)
     {
@@ -606,9 +556,8 @@ namespace
         return std::nullopt;
     }
 
-    // Look up the talker-alias tag attached to the source matching `unit_id`.
     // TR resolves unit_tags / OTA aliases into Call_Source.tag before
-    // call_end fires, so we don't keep our own cache.
+    // call_end fires.
     std::string alias_for_unit(const std::vector<CallSourceLite> &sources,
                                std::optional<std::int64_t> unit_id)
     {
@@ -623,8 +572,8 @@ namespace
         return {};
     }
 
-    // Append a text mime part. Skipped if `value` is empty and
-    // `omit_when_empty` is true.
+    // Append a text mime part. Skipped when value is empty unless
+    // omit_when_empty is false.
     void add_text_part(curl_mime *mime, const char *name,
                        const std::string &value,
                        bool omit_when_empty = true)
@@ -663,11 +612,9 @@ namespace
         return false;
     }
 
-    // Render the "why was this upload rejected?" string used in worker
-    // log lines. Prefers structured info from OpenScanner's error envelope
-    //   {"error":{"code":"duplicate_call","message":"...","details":{...}}}
-    // and falls back to a short description of well-known HTTP statuses
-    // when no envelope is present.
+    // Read the OpenScanner error envelope when present:
+    //   {"error":{"code":"duplicate_call","message":"..."}}
+    // Otherwise fall back to a short description of the HTTP status.
     std::string describe_failure(long status, const std::string &body)
     {
         std::string code, message;
@@ -686,7 +633,7 @@ namespace
         }
         catch (...)
         {
-            // fall through to status-code defaults
+            // Not JSON; use status-code defaults.
         }
 
         std::ostringstream out;
@@ -748,8 +695,8 @@ namespace
         if (delay > kBackoffCap.count())
             delay = kBackoffCap.count();
 
-        // Per-thread RNG so jitter is non-deterministic without re-seeding
-        // from random_device on every call.
+        // Per-thread RNG so jitter is non-deterministic without
+        // re-seeding on every call.
         static thread_local std::mt19937_64 rng(std::random_device{}());
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         const double r = dist(rng);
@@ -768,9 +715,7 @@ namespace
         return base + "/api/v1/calls";
     }
 
-    // Stat-based pre-flight. Returns true with `*size_out` populated if the
-    // file exists and is in range; false with `*error` set otherwise
-    // (missing, unreadable, too large).
+    // Verify the audio file exists, is regular, and fits the size cap.
     bool check_audio_file(const std::string &path,
                           std::uintmax_t *size_out,
                           std::string *error)
@@ -809,10 +754,7 @@ namespace
         return true;
     }
 
-    // ---------------------------------------------------------------------
-    // Uploader — single background thread, unbounded FIFO, libcurl mime POST.
-    // ---------------------------------------------------------------------
-
+    // Uploader — single background thread, FIFO queue, libcurl mime POST.
     class Uploader
     {
     public:
@@ -834,7 +776,7 @@ namespace
             }
             catch (...)
             {
-                // Never let an exception escape; TR is in our process.
+                // Don't let exceptions escape; we share TR's process.
             }
             if (curl_ != nullptr)
             {
@@ -895,7 +837,6 @@ namespace
                 return false;
             }
 
-            // Reset prior options so a repeat call doesn't reuse stale state.
             curl_easy_reset(curl_);
 
             curl_mime *mime = curl_mime_init(curl_);
@@ -908,7 +849,7 @@ namespace
             add_text_part(mime, "talkgroupId", std::to_string(job.talkgroup),
                           /*omit_when_empty=*/false);
 
-            // ---- optional integers (omit when zero/unset) ---------------
+            // ---- optional integers (omitted when zero/unset) ------------
             if (job.freq > 0.0)
             {
                 const auto freq_hz =
@@ -932,9 +873,8 @@ namespace
                               std::to_string(job.spike_count));
 
             // ---- JSON-string fields -------------------------------------
-            // sources / frequencies are emitted even when empty (so
-            // operators can audit empty-array cases). patches is omitted
-            // when the call wasn't patched.
+            // sources / frequencies always sent (even when empty);
+            // patches omitted when the call wasn't patched.
             add_text_part(mime, "sources",
                           build_sources_json(job.transmission_source_list),
                           /*omit_when_empty=*/false);
@@ -966,9 +906,7 @@ namespace
             curl_slist *headerlist = nullptr;
             const std::string auth = "Authorization: Bearer " + bearer_token_;
             headerlist = curl_slist_append(headerlist, auth.c_str());
-            // Disable libcurl's automatic Expect: 100-continue.
             headerlist = curl_slist_append(headerlist, "Expect:");
-
             const std::string user_agent =
                 std::string(kPluginName) + "/" + kPluginVersion;
 
@@ -1026,7 +964,7 @@ namespace
                     cv_.wait(lk, [this]
                              { return stopping_ || !queue_.empty(); });
                     if (queue_.empty())
-                        return; // stopping with nothing left to do
+                        return;
                     job = std::move(queue_.front());
                     queue_.pop_front();
                 }
@@ -1057,8 +995,6 @@ namespace
 
                     if (ok)
                     {
-                        // Match the bundled openmhz / rdioscanner format:
-                        //   <log_prefix>OpenScanner Upload Success - file size: N
                         BOOST_LOG_TRIVIAL(info)
                             << job.log_prefix
                             << "OpenScanner Upload Success - file size: "
@@ -1107,9 +1043,6 @@ namespace
                         << reason
                         << "); retrying in " << delay.count() << " ms";
 
-                    // Sleep through the backoff unconditionally; stop()
-                    // waits for the current retry chain plus the remaining
-                    // queue to drain fully.
                     std::this_thread::sleep_for(delay);
                 }
             }
@@ -1135,11 +1068,7 @@ namespace
 namespace squelch
 {
 
-    // -----------------------------------------------------------------------
-    // Plugin_Api subclass — the only public symbol. Exported under the alias
-    // `create_plugin` via BOOST_DLL_ALIAS at the bottom of this file.
-    // -----------------------------------------------------------------------
-
+    // Plugin_Api subclass exported via BOOST_DLL_ALIAS at the bottom.
     class SquelchUploader : public Plugin_Api
     {
     public:
@@ -1158,10 +1087,6 @@ namespace squelch
             }
             config_ = std::move(*parsed);
 
-            // Match the bundled openmhz / rdioscanner / broadcastify
-            // uploaders' parse_config() output. The API key is configured
-            // once at the plugin level (not per-system), so emit it on the
-            // server line and just list the systems below.
             BOOST_LOG_TRIVIAL(info)
                 << kLogPrefix << "OpenScanner Server: " << config_.server
                 << "\t API Key: " << ::redact(config_.api_key);
@@ -1180,18 +1105,15 @@ namespace squelch
             return 0;
         }
 
-        // NOTE: ::Config is TR's host-config struct; our PluginConfig lives
-        // in the anonymous namespace above.
+        // ::Config is TR's host-config struct.
         int init(::Config *tr_config,
                  std::vector<Source *> sources,
                  std::vector<System *> systems) override
         {
-            // Propagate TR's configured frequencyFormat into the global
-            // that formatter.cc::format_freq() reads. The default
-            // Plugin_Api::init() does this for plugins that don't override
-            // init(); we override (to be a no-op otherwise) so we have to
-            // do it ourselves, or call sites in TR's log_header() emit
-            // freqs in scientific notation (e.g. '7.705062e+08').
+            // The default Plugin_Api::init() copies frequency_format from
+            // the host config into formatter.cc's global. Since we override
+            // init(), we have to do it ourselves; otherwise log_header()
+            // emits scientific-notation freqs (e.g. "7.705062e+08").
             if (tr_config != nullptr)
                 frequency_format = tr_config->frequency_format;
             (void)sources;
@@ -1203,7 +1125,6 @@ namespace squelch
         {
             if (config_.server.empty() || config_.api_key.empty())
             {
-                // parse_config should have caught this, but defend anyway.
                 BOOST_LOG_TRIVIAL(error)
                     << kLogPrefix
                     << "start without server/apiKey; uploads disabled";
@@ -1228,7 +1149,7 @@ namespace squelch
             return 0;
         }
 
-        // ----- per-call hooks -----------------------------------------------
+        // ----- per-call hooks -----
 
         int call_start(Call *call) override
         {
@@ -1250,10 +1171,9 @@ namespace squelch
                 return 1;
             }
 
-            // Route to the matching SystemEntry by exact shortName. Calls
-            // for systems not listed in `systems[]` are dropped at debug
-            // level so a single plugin entry can fan out to a subset of
-            // TR's systems.
+            // Route by exact shortName; unlisted systems are dropped
+            // at debug level so one plugin instance can serve a subset
+            // of TR's systems.
             const ::SystemEntry *entry = nullptr;
             for (const auto &s : config_.systems)
             {
@@ -1274,9 +1194,7 @@ namespace squelch
                 return 0;
             }
 
-            // Pick the on-disk audio path the way TR exposes it: use the
-            // compressed file when call_info.compress_wav is set, otherwise
-            // the raw `filename`.
+            // Use the compressed (m4a) file when compress_wav is on.
             ::UploadJob job;
             job.talkgroup = call_info.talkgroup;
             job.start_time = call_info.start_time;
@@ -1290,8 +1208,6 @@ namespace squelch
             job.talkgroup_group = call_info.talkgroup_group;
             job.audio_path = call_info.compress_wav ? call_info.converted
                                                     : call_info.filename;
-            // shortName is required per entry, so always send the
-            // configured value as `systemLabel`.
             job.short_name = entry->short_name;
             job.patched_talkgroups = std::vector<unsigned long>(
                 call_info.patched_talkgroups.begin(),
@@ -1306,8 +1222,7 @@ namespace squelch
                 lite.source = s.source;
                 lite.time = s.time;
                 lite.position = s.position;
-                lite.length = 0.0; // TR's Call_Source has no per-tx length;
-                                   // duration_ms covers the whole call.
+                lite.length = 0.0; // Call_Source has no per-tx length.
                 lite.emergency = s.emergency;
                 lite.signal_system = s.signal_system;
                 lite.tag = s.tag;
@@ -1319,8 +1234,7 @@ namespace squelch
             for (const auto &f : call_info.transmission_error_list)
             {
                 ::CallFreqLite lite;
-                lite.freq = call_info.freq; // per-call freq; TR's Call_Error
-                                            // doesn't carry one.
+                lite.freq = call_info.freq; // Call_Error has no freq.
                 lite.time = f.time;
                 lite.position = f.position;
                 lite.total_len = f.total_len;
@@ -1347,11 +1261,6 @@ namespace squelch
 
             job.audio_bytes = audio_size;
 
-            // Pre-render the "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t"
-            // prefix using the same fields TR's bundled log_header() reads
-            // (short_name, call_num, talkgroup_display, freq), so worker
-            // log lines are formatted identically to openmhz / rdioscanner
-            // / broadcastify and slot into the per-system log stream.
             job.log_prefix = ::log_header(call_info.short_name,
                                           call_info.call_num,
                                           call_info.talkgroup_display,
@@ -1361,7 +1270,7 @@ namespace squelch
             return 0;
         }
 
-        // ----- recorder / system / source setup -----------------------------
+        // ----- recorder / system / source setup -----
 
         int setup_recorder(Recorder *recorder) override
         {
@@ -1387,7 +1296,7 @@ namespace squelch
             return 0;
         }
 
-        // ----- unit-level hooks ---------------------------------------------
+        // ----- unit-level hooks -----
 
         int unit_registration(System *sys, long source_id) override
         {
@@ -1437,7 +1346,7 @@ namespace squelch
             return 0;
         }
 
-        // ----- factory ------------------------------------------------------
+        // ----- factory -----
 
         static boost::shared_ptr<SquelchUploader> create()
         {
@@ -1451,9 +1360,9 @@ namespace squelch
 
 } // namespace squelch
 
-// Exported under the alias name `create_plugin`, which is what TR's plugin
-// loader looks for.
+// Exported under the alias `create_plugin`, which TR's plugin loader
+// dlsym()s.
 BOOST_DLL_ALIAS(
-    squelch::SquelchUploader::create, // <-- this function is exported with…
-    create_plugin                     // <-- …this alias name
+    squelch::SquelchUploader::create,
+    create_plugin
 )
