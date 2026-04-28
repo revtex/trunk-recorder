@@ -1186,12 +1186,14 @@ namespace squelch
                  std::vector<Source *> sources,
                  std::vector<System *> systems) override
         {
-            // The plugin emits frequencyHz on the wire as a plain integer
-            // via its own stringstreams, so we don't need to read TR's
-            // host-level config here. Per-call log lines route through
-            // TR's `log_header()` / `format_freq()`, which read the global
-            // `frequency_format` set by TR itself before init() runs.
-            (void)tr_config;
+            // Propagate TR's configured frequencyFormat into the global
+            // that formatter.cc::format_freq() reads. The default
+            // Plugin_Api::init() does this for plugins that don't override
+            // init(); we override (to be a no-op otherwise) so we have to
+            // do it ourselves, or call sites in TR's log_header() emit
+            // freqs in scientific notation (e.g. '7.705062e+08').
+            if (tr_config != nullptr)
+                frequency_format = tr_config->frequency_format;
             (void)sources;
             (void)systems;
             return 0;
