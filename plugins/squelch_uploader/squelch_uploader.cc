@@ -46,11 +46,6 @@
 #include <utility>
 #include <vector>
 
-namespace squelch
-{
-    class SquelchUploader; // forward — defined below.
-} // namespace squelch
-
 namespace
 {
 
@@ -1101,22 +1096,6 @@ namespace squelch
             return 0;
         }
 
-        // ::Config is TR's host-config struct.
-        int init(::Config *tr_config,
-                 std::vector<Source *> sources,
-                 std::vector<System *> systems) override
-        {
-            // The default Plugin_Api::init() copies frequency_format from
-            // the host config into formatter.cc's global. Since we override
-            // init(), we have to do it ourselves; otherwise log_header()
-            // emits scientific-notation freqs (e.g. "7.705062e+08").
-            if (tr_config != nullptr)
-                frequency_format = tr_config->frequency_format;
-            (void)sources;
-            (void)systems;
-            return 0;
-        }
-
         int start() override
         {
             if (config_.server.empty() || config_.api_key.empty())
@@ -1142,14 +1121,6 @@ namespace squelch
                 uploader_->stop();
                 uploader_.reset();
             }
-            return 0;
-        }
-
-        // ----- per-call hooks -----
-
-        int call_start(Call *call) override
-        {
-            (void)call;
             return 0;
         }
 
@@ -1265,84 +1236,6 @@ namespace squelch
             uploader_->enqueue(std::move(job));
             return 0;
         }
-
-        // ----- recorder / system / source setup -----
-
-        int setup_recorder(Recorder *recorder) override
-        {
-            (void)recorder;
-            return 0;
-        }
-
-        int setup_system(System *system) override
-        {
-            (void)system;
-            return 0;
-        }
-
-        int setup_systems(std::vector<System *> systems) override
-        {
-            (void)systems;
-            return 0;
-        }
-
-        int setup_sources(std::vector<Source *> sources) override
-        {
-            (void)sources;
-            return 0;
-        }
-
-        // ----- unit-level hooks -----
-
-        int unit_registration(System *sys, long source_id) override
-        {
-            (void)sys;
-            (void)source_id;
-            return 0;
-        }
-
-        int unit_deregistration(System *sys, long source_id) override
-        {
-            (void)sys;
-            (void)source_id;
-            return 0;
-        }
-
-        int unit_acknowledge_response(System *sys, long source_id) override
-        {
-            (void)sys;
-            (void)source_id;
-            return 0;
-        }
-
-        int unit_data_grant(System *sys, long source_id) override
-        {
-            (void)sys;
-            (void)source_id;
-            return 0;
-        }
-
-        int unit_answer_request(System *sys,
-                                long source_id,
-                                long talkgroup) override
-        {
-            (void)sys;
-            (void)source_id;
-            (void)talkgroup;
-            return 0;
-        }
-
-        int unit_location(System *sys,
-                          long source_id,
-                          long talkgroup_num) override
-        {
-            (void)sys;
-            (void)source_id;
-            (void)talkgroup_num;
-            return 0;
-        }
-
-        // ----- factory -----
 
         static boost::shared_ptr<SquelchUploader> create()
         {
