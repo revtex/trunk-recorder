@@ -367,8 +367,6 @@ namespace
     constexpr std::chrono::milliseconds kBackoffCap{30000};
     constexpr double kJitterRatio = 0.20;
 
-    // Render an API key as "******xx" (last two chars). All asterisks
-    // if the key is too short.
     std::string redact(const std::string &key)
     {
         if (key.size() <= 2)
@@ -384,7 +382,6 @@ namespace
         return s;
     }
 
-    // TR only ever produces .wav (raw) or .m4a (when compress_wav is on).
     std::string audio_content_type_for(const std::string &path)
     {
         const auto dot = path.find_last_of('.');
@@ -686,8 +683,6 @@ namespace
         if (delay > kBackoffCap.count())
             delay = kBackoffCap.count();
 
-        // Per-thread RNG so jitter is non-deterministic without
-        // re-seeding on every call.
         static thread_local std::mt19937_64 rng(std::random_device{}());
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         const double r = dist(rng);
@@ -1008,10 +1003,19 @@ namespace
 
                     if (!retriable)
                     {
-                        BOOST_LOG_TRIVIAL(error)
-                            << job.log_prefix
-                            << "Squelch Upload rejected: " << reason
-                            << "; not retrying";
+                        if (status == 409)
+                        {
+                            BOOST_LOG_TRIVIAL(info)
+                                << job.log_prefix
+                                << "Squelch Upload skipped: " << reason;
+                        }
+                        else
+                        {
+                            BOOST_LOG_TRIVIAL(error)
+                                << job.log_prefix
+                                << "Squelch Upload rejected: " << reason
+                                << "; not retrying";
+                        }
                         break;
                     }
 
@@ -1054,12 +1058,11 @@ namespace
         std::thread worker_;
     };
 
-} // anonymous namespace
+}
 
 namespace squelch
 {
 
-    // Plugin_Api subclass exported via BOOST_DLL_ALIAS at the bottom.
     class SquelchUploader : public Plugin_Api
     {
     public:
@@ -1201,7 +1204,7 @@ namespace squelch
             for (const auto &f : call_info.transmission_error_list)
             {
                 ::CallFreqLite lite;
-                lite.freq = call_info.freq; // Call_Error has no freq.
+                lite.freq = call_info.freq;
                 lite.time = f.time;
                 lite.position = f.position;
                 lite.total_len = f.total_len;
@@ -1247,10 +1250,9 @@ namespace squelch
         std::unique_ptr<::Uploader> uploader_;
     };
 
-} // namespace squelch
+}
 
-// Exported under the alias `create_plugin`, which TR's plugin loader
-// dlsym()s.
+// Exported under the alias `create_plugin`, which TR's plugin loader dlsym()s.
 BOOST_DLL_ALIAS(
     squelch::SquelchUploader::create,
     create_plugin
