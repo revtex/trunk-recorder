@@ -17,7 +17,7 @@
 // `squelch::SquelchUploader::create` crosses the ABI boundary (via
 // `BOOST_DLL_ALIAS`).
 
-#include "trunk-recorder/plugin_manager/plugin_api.h"
+#include "../../trunk-recorder/plugin_manager/plugin_api.h"
 
 #include <curl/curl.h>
 
