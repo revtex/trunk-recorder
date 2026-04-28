@@ -18,6 +18,7 @@
 // `BOOST_DLL_ALIAS`).
 
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
+#include "../../trunk-recorder/formatter.h"
 
 #include <curl/curl.h>
 
@@ -63,6 +64,13 @@ namespace
 
     constexpr const char *kPluginName = "squelch_uploader";
     constexpr const char *kPluginVersion = "0.2.2";
+
+    // Plugin-level log prefix used for lifecycle and config messages
+    // (init / parse_config / start / stop) that don't have a per-call
+    // context. Mirrors the bundled openmhz / rdioscanner uploaders'
+    // "\t[OpenMHz]\t" / "\t[Rdio Scanner]\t" style so the openscanner
+    // plugin slots into TR's log stream the same way.
+    constexpr const char *kLogPrefix = "\t[OpenScanner]\t";
 
     // Squelch v1's upload-route ceiling. Files larger than this are rejected
     // before opening a connection.
@@ -394,8 +402,14 @@ namespace
 
         long system_id = 0;
 
-        // Human-friendly identifier used in log lines. Never the API key.
-        std::string debug_tag;
+        // File size (bytes) captured at preflight; included in the success
+        // log line to match the bundled openmhz / rdioscanner format.
+        std::uintmax_t audio_bytes = 0;
+
+        // Pre-rendered "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t" prefix
+        // matching TR's `log_header()` so our log lines line up with the
+        // bundled openmhz / rdioscanner / broadcastify uploaders.
+        std::string log_prefix;
     };
 
     // ---------------------------------------------------------------------
@@ -406,12 +420,14 @@ namespace
     constexpr std::chrono::milliseconds kBackoffCap{30000};
     constexpr double kJitterRatio = 0.20;
 
-    // Mask all but the leading 6 chars of an API key. Never log the full secret.
+    // Render an API key the way TR's bundled uploaders do: six asterisks
+    // followed by the last two characters (e.g. "******29"). Returns all
+    // asterisks if the key is too short to safely reveal a tail.
     std::string redact(const std::string &key)
     {
-        if (key.size() <= 6)
-            return std::string(key.size(), '*');
-        return key.substr(0, 6) + "…";
+        if (key.size() <= 2)
+            return std::string(8, '*');
+        return std::string(6, '*') + key.substr(key.size() - 2);
     }
 
     std::string to_lower(std::string s)
@@ -968,13 +984,18 @@ namespace
 
                     if (ok)
                     {
+                        // Match the bundled openmhz / rdioscanner format:
+                        //   <log_prefix>OpenScanner Upload Success - file size: N
+                        BOOST_LOG_TRIVIAL(info)
+                            << job.log_prefix
+                            << "OpenScanner Upload Success - file size: "
+                            << job.audio_bytes;
                         if (attempt > 0)
                         {
                             BOOST_LOG_TRIVIAL(info)
-                                << "[" << kPluginName
-                                << "] upload succeeded after "
-                                << (attempt + 1) << " attempts ("
-                                << job.debug_tag << ")";
+                                << job.log_prefix
+                                << "OpenScanner Upload succeeded after "
+                                << (attempt + 1) << " attempts";
                         }
                         break;
                     }
@@ -986,9 +1007,9 @@ namespace
                     if (!retriable)
                     {
                         BOOST_LOG_TRIVIAL(error)
-                            << "[" << kPluginName << "] upload rejected (HTTP "
-                            << status << ") for " << job.debug_tag
-                            << "; not retrying";
+                            << job.log_prefix
+                            << "OpenScanner Upload rejected (HTTP "
+                            << status << "); not retrying";
                         break;
                     }
 
@@ -997,30 +1018,30 @@ namespace
                         if (network_error)
                         {
                             BOOST_LOG_TRIVIAL(error)
-                                << "[" << kPluginName
-                                << "] upload failed after " << attempts
-                                << " attempts (network error: " << err
-                                << ") for " << job.debug_tag;
+                                << job.log_prefix
+                                << "OpenScanner Upload failed after "
+                                << attempts
+                                << " attempts (network error: " << err << ")";
                         }
                         else
                         {
                             BOOST_LOG_TRIVIAL(error)
-                                << "[" << kPluginName
-                                << "] upload failed after " << attempts
-                                << " attempts (HTTP " << status << ") for "
-                                << job.debug_tag;
+                                << job.log_prefix
+                                << "OpenScanner Upload failed after "
+                                << attempts << " attempts (HTTP " << status
+                                << ")";
                         }
                         break;
                     }
 
                     const auto delay = backoff_for_attempt(attempt);
                     BOOST_LOG_TRIVIAL(warning)
-                        << "[" << kPluginName << "] upload attempt "
+                        << job.log_prefix
+                        << "OpenScanner Upload attempt "
                         << (attempt + 1) << "/" << attempts << " failed ("
                         << (network_error ? err
                                           : "HTTP " + std::to_string(status))
-                        << "); retrying in " << delay.count() << " ms ("
-                        << job.debug_tag << ")";
+                        << "); retrying in " << delay.count() << " ms";
 
                     // Sleep through the backoff unconditionally; stop()
                     // waits for the current retry chain plus the remaining
@@ -1068,23 +1089,30 @@ namespace squelch
             if (!parsed)
             {
                 BOOST_LOG_TRIVIAL(error)
-                    << "[" << kPluginName << "] invalid config: " << error;
+                    << kLogPrefix << "invalid config: " << error;
                 return 1;
             }
             config_ = std::move(*parsed);
-            std::ostringstream sys_summary;
-            for (std::size_t i = 0; i < config_.systems.size(); ++i)
-            {
-                if (i != 0)
-                    sys_summary << ", ";
-                sys_summary << config_.systems[i].short_name
-                            << "=" << config_.systems[i].system_id;
-            }
+
+            // Match the bundled openmhz / rdioscanner / broadcastify
+            // uploaders' parse_config() output: one "<plugin> Server: <url>"
+            // line followed by one "Uploading calls for: <short>\t<plugin>
+            // System: <id>\t API Key: ******xx" line per configured system.
             BOOST_LOG_TRIVIAL(info)
-                << "[" << kPluginName << "] config parsed: server="
-                << config_.server << " apiKey="
-                << ::redact(config_.api_key) << " systems=["
-                << sys_summary.str() << "]";
+                << kLogPrefix << "OpenScanner Server: " << config_.server;
+            for (const auto &sys : config_.systems)
+            {
+                BOOST_LOG_TRIVIAL(info)
+                    << kLogPrefix << "Uploading calls for: " << sys.short_name
+                    << "\t OpenScanner System: " << sys.system_id
+                    << "\t API Key: " << ::redact(config_.api_key);
+            }
+            if (config_.systems.empty())
+            {
+                BOOST_LOG_TRIVIAL(error)
+                    << kLogPrefix
+                    << "OpenScanner Server set, but no Systems are configured";
+            }
             return 0;
         }
 
@@ -1094,37 +1122,25 @@ namespace squelch
                  std::vector<Source *> sources,
                  std::vector<System *> systems) override
         {
-            // Intentionally do NOT propagate tr_config->frequency_format into
-            // TR's global `frequency_format` (defined in formatter.cc). That
-            // symbol is exported by trunk_recorder_library, which the bundled
-            // TR plugins link against directly. We build out-of-tree (headers
-            // only via FetchContent), so referencing the global produces an
-            // undefined symbol that dlopen() cannot resolve against the
-            // visibility-hidden trunk-recorder executable:
-            //
-            //   dlerror: undefined symbol: frequency_format
-            //
-            // The plugin emits frequencyHz as a plain integer via its own
-            // stringstreams, so it never needs TR's format_freq() helper and
-            // therefore never needs the global at all.
+            // The plugin emits frequencyHz on the wire as a plain integer
+            // via its own stringstreams, so we don't need to read TR's
+            // host-level config here. Per-call log lines route through
+            // TR's `log_header()` / `format_freq()`, which read the global
+            // `frequency_format` set by TR itself before init() runs.
             (void)tr_config;
             (void)sources;
             (void)systems;
-            BOOST_LOG_TRIVIAL(info)
-                << "[" << kPluginName << " " << kPluginVersion << "] init";
             return 0;
         }
 
         int start() override
         {
-            BOOST_LOG_TRIVIAL(info) << "[" << kPluginName << "] start";
-
             if (config_.server.empty() || config_.api_key.empty())
             {
                 // parse_config should have caught this, but defend anyway.
                 BOOST_LOG_TRIVIAL(error)
-                    << "[" << kPluginName
-                    << "] start without server/apiKey; uploads disabled";
+                    << kLogPrefix
+                    << "start without server/apiKey; uploads disabled";
                 return 1;
             }
 
@@ -1133,21 +1149,15 @@ namespace squelch
                 config_.api_key,
                 config_.max_retries);
             uploader_->start();
-            BOOST_LOG_TRIVIAL(info)
-                << "[" << kPluginName << "] uploader started maxRetries="
-                << config_.max_retries;
             return 0;
         }
 
         int stop() override
         {
-            BOOST_LOG_TRIVIAL(info) << "[" << kPluginName << "] stop";
             if (uploader_)
             {
                 uploader_->stop();
                 uploader_.reset();
-                BOOST_LOG_TRIVIAL(info)
-                    << "[" << kPluginName << "] uploader stopped";
             }
             return 0;
         }
@@ -1165,8 +1175,11 @@ namespace squelch
             if (!uploader_)
             {
                 BOOST_LOG_TRIVIAL(error)
-                    << "[" << kPluginName
-                    << "] uploader not running; dropping upload of "
+                    << ::log_header(call_info.short_name,
+                                    call_info.call_num,
+                                    call_info.talkgroup_display,
+                                    call_info.freq)
+                    << "OpenScanner uploader not running; dropping upload of "
                     << call_info.filename;
                 return 1;
             }
@@ -1187,10 +1200,11 @@ namespace squelch
             if (entry == nullptr)
             {
                 BOOST_LOG_TRIVIAL(debug)
-                    << "[" << kPluginName
-                    << "] dropping call for unconfigured system '"
-                    << call_info.short_name << "' (tg="
-                    << call_info.talkgroup << ")";
+                    << ::log_header(call_info.short_name,
+                                    call_info.call_num,
+                                    call_info.talkgroup_display,
+                                    call_info.freq)
+                    << "OpenScanner dropping call for unconfigured system";
                 return 0;
             }
 
@@ -1256,13 +1270,26 @@ namespace squelch
                                     &preflight_error))
             {
                 BOOST_LOG_TRIVIAL(error)
-                    << "[" << kPluginName << "] " << preflight_error;
+                    << ::log_header(call_info.short_name,
+                                    call_info.call_num,
+                                    call_info.talkgroup_display,
+                                    call_info.freq)
+                    << "OpenScanner Upload preflight failed: "
+                    << preflight_error;
                 return 1;
             }
 
-            job.debug_tag = "tg=" + std::to_string(job.talkgroup) +
-                            " started=" + std::to_string(job.start_time) +
-                            " bytes=" + std::to_string(audio_size);
+            job.audio_bytes = audio_size;
+
+            // Pre-render the "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t"
+            // prefix using the same fields TR's bundled log_header() reads
+            // (short_name, call_num, talkgroup_display, freq), so worker
+            // log lines are formatted identically to openmhz / rdioscanner
+            // / broadcastify and slot into the per-system log stream.
+            job.log_prefix = ::log_header(call_info.short_name,
+                                          call_info.call_num,
+                                          call_info.talkgroup_display,
+                                          call_info.freq);
 
             uploader_->enqueue(std::move(job));
             return 0;
