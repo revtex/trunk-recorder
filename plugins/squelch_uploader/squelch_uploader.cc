@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // squelch_uploader.cc — TR plugin that uploads completed calls to
-// OpenScanner over HTTPS. Single translation unit modeled on TR's
+// Squelch over HTTPS. Single translation unit modeled on TR's
 // bundled uploaders. Contains:
 //
 //   * config parsing (server / apiKey / maxRetries / systems[])
@@ -56,11 +56,11 @@ namespace
 
     constexpr const char *kPluginName = "squelch_uploader";
     constexpr const char *kPluginVersion = "0.2.2";
-    constexpr const char *kLogPrefix = "\t[OpenScanner]\t";
+    constexpr const char *kLogPrefix = "\t[Squelch]\t";
     constexpr std::size_t kMaxUploadBytes = 50ULL * 1024ULL * 1024ULL;
 
     // Plugin config. One instance can fan out to multiple TR systems on
-    // the same OpenScanner host. Calls are routed by matching shortName;
+    // the same Squelch host. Calls are routed by matching shortName;
     // calls for unlisted systems are dropped.
     //
     //   {
@@ -608,7 +608,7 @@ namespace
         return false;
     }
 
-    // Read the OpenScanner error envelope when present:
+    // Read the Squelch error envelope when present:
     //   {"error":{"code":"duplicate_call","message":"..."}}
     // Otherwise fall back to a short description of the HTTP status.
     std::string describe_failure(long status, const std::string &body)
@@ -993,13 +993,13 @@ namespace
                     {
                         BOOST_LOG_TRIVIAL(info)
                             << job.log_prefix
-                            << "OpenScanner Upload Success - file size: "
+                            << "Squelch Upload Success - file size: "
                             << job.audio_bytes;
                         if (attempt > 0)
                         {
                             BOOST_LOG_TRIVIAL(info)
                                 << job.log_prefix
-                                << "OpenScanner Upload succeeded after "
+                                << "Squelch Upload succeeded after "
                                 << (attempt + 1) << " attempts";
                         }
                         break;
@@ -1015,7 +1015,7 @@ namespace
                     {
                         BOOST_LOG_TRIVIAL(error)
                             << job.log_prefix
-                            << "OpenScanner Upload rejected: " << reason
+                            << "Squelch Upload rejected: " << reason
                             << "; not retrying";
                         break;
                     }
@@ -1024,7 +1024,7 @@ namespace
                     {
                         BOOST_LOG_TRIVIAL(error)
                             << job.log_prefix
-                            << "OpenScanner Upload failed after " << attempts
+                            << "Squelch Upload failed after " << attempts
                             << " attempts ("
                             << (network_error ? "network error: " : "")
                             << reason << ")";
@@ -1034,7 +1034,7 @@ namespace
                     const auto delay = backoff_for_attempt(attempt);
                     BOOST_LOG_TRIVIAL(warning)
                         << job.log_prefix
-                        << "OpenScanner Upload attempt "
+                        << "Squelch Upload attempt "
                         << (attempt + 1) << "/" << attempts << " failed ("
                         << reason
                         << "); retrying in " << delay.count() << " ms";
@@ -1084,19 +1084,19 @@ namespace squelch
             config_ = std::move(*parsed);
 
             BOOST_LOG_TRIVIAL(info)
-                << kLogPrefix << "OpenScanner Server: " << config_.server
+                << kLogPrefix << "Squelch Server: " << config_.server
                 << "\t API Key: " << ::redact(config_.api_key);
             for (const auto &sys : config_.systems)
             {
                 BOOST_LOG_TRIVIAL(info)
                     << kLogPrefix << "Uploading calls for: " << sys.short_name
-                    << "\t OpenScanner System: " << sys.system_id;
+                    << "\t Squelch System: " << sys.system_id;
             }
             if (config_.systems.empty())
             {
                 BOOST_LOG_TRIVIAL(error)
                     << kLogPrefix
-                    << "OpenScanner Server set, but no Systems are configured";
+                    << "Squelch Server set, but no Systems are configured";
             }
             return 0;
         }
@@ -1162,7 +1162,7 @@ namespace squelch
                                     call_info.call_num,
                                     call_info.talkgroup_display,
                                     call_info.freq)
-                    << "OpenScanner uploader not running; dropping upload of "
+                    << "Squelch uploader not running; dropping upload of "
                     << call_info.filename;
                 return 1;
             }
@@ -1186,7 +1186,7 @@ namespace squelch
                                     call_info.call_num,
                                     call_info.talkgroup_display,
                                     call_info.freq)
-                    << "OpenScanner dropping call for unconfigured system";
+                    << "Squelch dropping call for unconfigured system";
                 return 0;
             }
 
@@ -1250,7 +1250,7 @@ namespace squelch
                                     call_info.call_num,
                                     call_info.talkgroup_display,
                                     call_info.freq)
-                    << "OpenScanner Upload preflight failed: "
+                    << "Squelch Upload preflight failed: "
                     << preflight_error;
                 return 1;
             }
