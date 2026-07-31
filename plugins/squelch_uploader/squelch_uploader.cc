@@ -25,6 +25,7 @@
 #include <json.hpp>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -34,8 +35,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,7 +53,7 @@ namespace
 {
 
     constexpr const char *kPluginName = "squelch_uploader";
-    constexpr const char *kPluginVersion = "0.2.2";
+    constexpr const char *kPluginVersion = "0.2.3";
     constexpr const char *kLogPrefix = "\t[Squelch]\t";
     constexpr std::size_t kMaxUploadBytes = 50ULL * 1024ULL * 1024ULL;
 
@@ -357,6 +360,11 @@ namespace
         long system_id = 0;
 
         std::uintmax_t audio_bytes = 0;
+
+        // When non-empty, audio_path is a private staged copy the worker owns
+        // and must unlink once the job is finished (success, reject, or
+        // exhausted retries).
+        std::string temp_path;
 
         // Pre-rendered TR log_header() prefix:
         //   "[short]\t<call>C\tTG: <tg>\tFreq: <freq>\t"
@@ -740,6 +748,92 @@ namespace
         return true;
     }
 
+    // Copy `src` into a freshly created, uniquely named temp file in the system
+    // temp dir ($TMPDIR or /tmp), preserving the extension so MIME
+    // content-type detection still works. Returns the staged path (the caller
+    // owns it and must unlink), or an empty string on failure with *error set.
+    //
+    // This is what makes the async upload safe: TR removes or recycles the
+    // recording once every plugin's call_end() returns, so a queued job or a
+    // retry backoff would otherwise stream a file that has already been
+    // deleted — the source of libcurl CURLE_READ_ERROR ("read function
+    // returned funny value"). Staging a copy while call_end still holds the
+    // file decouples the upload from TR's cleanup entirely.
+    std::string stage_audio_copy(const std::string &src, std::string *error)
+    {
+        // Preserve the extension (".wav" / ".m4a") as an mkstemps suffix.
+        std::string ext;
+        const auto slash = src.find_last_of('/');
+        const auto dot = src.find_last_of('.');
+        if (dot != std::string::npos &&
+            (slash == std::string::npos || dot > slash))
+            ext = src.substr(dot);
+        if (ext.size() > 8) // guard against pathological "extensions"
+            ext.clear();
+
+        const char *tmpenv = std::getenv("TMPDIR");
+        std::string dir = (tmpenv && *tmpenv) ? tmpenv : "/tmp";
+        while (dir.size() > 1 && dir.back() == '/')
+            dir.pop_back();
+
+        std::string tmpl = dir + "/squelch-XXXXXX" + ext;
+        std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+        tmpl_buf.push_back('\0');
+
+        const int fd = ::mkstemps(tmpl_buf.data(), static_cast<int>(ext.size()));
+        if (fd < 0)
+        {
+            if (error)
+                *error = "could not create temp file in " + dir;
+            return {};
+        }
+        const std::string dst(tmpl_buf.data());
+
+        std::ifstream in(src, std::ios::binary);
+        if (!in)
+        {
+            ::close(fd);
+            ::unlink(dst.c_str());
+            if (error)
+                *error = "could not open source: " + src;
+            return {};
+        }
+
+        bool ok = true;
+        char buf[64 * 1024];
+        while (in.read(buf, sizeof(buf)) || in.gcount() > 0)
+        {
+            std::streamsize left = in.gcount();
+            const char *p = buf;
+            while (left > 0)
+            {
+                const ssize_t w =
+                    ::write(fd, p, static_cast<std::size_t>(left));
+                if (w <= 0)
+                {
+                    ok = false;
+                    break;
+                }
+                p += w;
+                left -= w;
+            }
+            if (!ok)
+                break;
+        }
+        if (in.bad())
+            ok = false;
+
+        ::close(fd);
+        if (!ok)
+        {
+            ::unlink(dst.c_str());
+            if (error)
+                *error = "copy failed for: " + src;
+            return {};
+        }
+        return dst;
+    }
+
     // Uploader — single background thread, FIFO queue, libcurl mime POST.
     class Uploader
     {
@@ -1040,6 +1134,11 @@ namespace
 
                     std::this_thread::sleep_for(delay);
                 }
+
+                // Remove the staged copy now that the job is finished, whether
+                // it succeeded, was rejected, or exhausted its retries.
+                if (!job.temp_path.empty())
+                    ::unlink(job.temp_path.c_str());
             }
         }
 
@@ -1235,6 +1334,28 @@ namespace squelch
                                           call_info.call_num,
                                           call_info.talkgroup_display,
                                           call_info.freq);
+
+            // Stage a private copy while TR still guarantees the file exists
+            // (it removes/recycles the recording after every plugin's
+            // call_end returns). The async worker uploads from this copy, so a
+            // backlogged queue or a retry backoff can no longer race TR's
+            // cleanup. Falls back to the original path (legacy best-effort
+            // behaviour) if staging fails.
+            std::string stage_error;
+            std::string staged =
+                ::stage_audio_copy(job.audio_path, &stage_error);
+            if (!staged.empty())
+            {
+                job.temp_path = staged;
+                job.audio_path = std::move(staged);
+            }
+            else
+            {
+                BOOST_LOG_TRIVIAL(warning)
+                    << job.log_prefix
+                    << "Squelch staging copy failed (" << stage_error
+                    << "); uploading original path, which may race TR cleanup";
+            }
 
             uploader_->enqueue(std::move(job));
             return 0;
