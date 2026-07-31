@@ -23,6 +23,8 @@ RUN apt-get update && \
     libhackrf-dev \
     libmirisdr-dev \
     liborc-0.4-dev \
+    libpaho-mqtt-dev \
+    libpaho-mqttpp-dev \
     libpthread-stubs0-dev \
     librtlsdr-dev \
     libsndfile1-dev \
@@ -36,12 +38,19 @@ RUN apt-get update && \
     wget \
     python3-six \
     openssh-client \
-    ffmpeg && \
+    ffmpeg \
+    libiio-dev \
+    libiio-utils \
+    libad9361-dev \
+    libgnuradio-iio3.10.9t64 && \
   rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
 COPY . .
+
+RUN git -C /src/user_plugins \
+       clone --depth 1 https://github.com/TrunkRecorder/tr-plugin-mqtt.git
 
 WORKDIR /src/build
 
@@ -59,6 +68,8 @@ RUN apt-get update && \
       curl \
       wget \
       docker.io \
+      libpaho-mqtt-dev \
+      libpaho-mqttpp-dev \
       ffmpeg \
       libboost-log1.83.0 \
       libboost-chrono1.83.0t64 \
@@ -68,6 +79,9 @@ RUN apt-get update && \
       libgnuradio-network3.10.9t64 \
       libgnuradio-uhd3.10.9t64 \
       libgnuradio-osmosdr0.2.0t64 \
+      libiio-dev libiio-utils \
+      libad9361-dev \
+      libgnuradio-iio3.10.9t64 \
       libsoapysdr0.8 \
       soapysdr0.8-module-all \
       libairspyhf1 \

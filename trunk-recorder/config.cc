@@ -262,6 +262,25 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
         system->set_short_name(element.value("shortName", default_script.str()));
         BOOST_LOG_TRIVIAL(info) << "Short Name: " << system->get_short_name();
 
+        // The shortName is used as part of directory and file paths, so reject
+        // characters that would corrupt those paths or break shell-invoked
+        // tools like sox/ffmpeg (issue #995).
+        {
+          std::string sn = system->get_short_name();
+          if (sn.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "shortName is empty - please set a shortName in config.json";
+            return false;
+          }
+          if (sn.find(' ') != std::string::npos) {
+            BOOST_LOG_TRIVIAL(error) << "shortName \"" << sn << "\" contains a space. Spaces are not allowed - they corrupt recording file paths and break sox/ffmpeg. Use _ or - instead.";
+            return false;
+          }
+          if (!std::regex_match(sn, std::regex("^[A-Za-z0-9._-]+$"))) {
+            BOOST_LOG_TRIVIAL(error) << "shortName \"" << sn << "\" contains invalid characters. Only letters, digits, '.', '_' and '-' are allowed - other characters break recording file paths and shell-invoked tools.";
+            return false;
+          }
+        }
+
         system->set_system_type(element["type"]);
         BOOST_LOG_TRIVIAL(info) << "System Type: " << system->get_system_type();
 
@@ -292,7 +311,7 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
             return false;
           }
           // If it is a Trunked System
-        } else if ((system->get_system_type() == "smartnet") || (system->get_system_type() == "p25")) {
+        } else if ((system->get_system_type() == "smartnet") || (system->get_system_type() == "p25") || (system->get_system_type() == "dmr")) {
           BOOST_LOG_TRIVIAL(info) << "Control Channels: ";
           std::vector<double> control_channels = element["control_channels"];
           for (auto &control_channel : control_channels) {
@@ -312,6 +331,35 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
             BOOST_LOG_TRIVIAL(info) << "Custom Frequency Table File: " << custom_freq_table_file;
           }
 
+          // DMR trunked systems map grants to voice frequencies via either
+          // an explicit `lcnTable` ({ "<lcn>": <hz>, ... }) or a `channels`
+          // candidate list (auto-mapped on first sighting of each LCN).
+          // At least one of the two must be present.
+          if (system->get_system_type() == "dmr") {
+            bool has_lcn_table = element.contains("lcnTable");
+            bool has_channels  = element.contains("channels");
+            if (!has_lcn_table && !has_channels) {
+              BOOST_LOG_TRIVIAL(error) << "Trunked DMR system requires either \"lcnTable\" (LCN id -> Hz) or \"channels\" (candidate voice freqs to auto-map on demand)";
+              return false;
+            }
+            if (has_lcn_table) {
+              BOOST_LOG_TRIVIAL(info) << "DMR LCN Table:";
+              for (auto &entry : element["lcnTable"].items()) {
+                int lcn = std::stoi(entry.key());
+                double freq = entry.value();
+                system->add_lcn_freq(lcn, freq);
+                BOOST_LOG_TRIVIAL(info) << "  LCN " << lcn << " -> " << format_freq(freq);
+              }
+            }
+            if (has_channels) {
+              BOOST_LOG_TRIVIAL(info) << "DMR auto-mapping candidate channels:";
+              std::vector<double> dmr_channels = element["channels"];
+              for (auto &freq : dmr_channels) {
+                system->add_channel(freq);
+                BOOST_LOG_TRIVIAL(info) << "  " << format_freq(freq);
+              }
+            }
+          }
 
         } else {
           BOOST_LOG_TRIVIAL(error) << "System Type in config.json not recognized";
@@ -555,14 +603,15 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
         bool gain_set = false;
         std::string driver = element.value("driver", "");
 
-        if ((driver != "osmosdr") && (driver != "usrp") && (driver != "sigmf") && (driver != "iqfile")) {
-          BOOST_LOG_TRIVIAL(error) << "Driver specified in config.json not recognized, needs to be osmosdr, sigmf, iqfile or usrp";
+        if ((driver != "osmosdr") && (driver != "usrp") && (driver != "sigmf") && (driver != "iqfile") && (driver != "iio")) {
+          BOOST_LOG_TRIVIAL(error) << "Driver specified in config.json not recognized, needs to be osmosdr, sigmf, iqfile, usrp, or iio";
           return false;
         }
 
         int digital_recorders = element.value("digitalRecorders", 0);
         int sigmf_recorders = element.value("sigmfRecorders", 0);
         int analog_recorders = element.value("analogRecorders", 0);
+        int dmr_recorders = element.value("dmrRecorders", 0);
 
         if (driver == "sigmf") {
           string sigmf_data = element.value("sigmfData", "");
@@ -579,7 +628,9 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
             BOOST_LOG_TRIVIAL(error) << "IQ Type specified in config.json not recognized, needs to be complex or float";
             return false;
           }
-          source = new Source(iq_file, center, rate, repeat, &config);
+          // Source ctor is (file, repeat, center, rate, cfg) — args were
+          // mis-ordered, leaving iqfile sources with center=rate and rate=0.
+          source = new Source(iq_file, repeat, center, rate, &config);
         } else {
 
           std::string device = element.value("device", "");
@@ -728,9 +779,11 @@ bool load_config(string config_file, Config &config, gr::top_block_sptr &tb, std
         BOOST_LOG_TRIVIAL(info) << "Digital Recorders: " << element.value("digitalRecorders", 0);
         BOOST_LOG_TRIVIAL(info) << "SigMF Recorders: " << element.value("sigmfRecorders", 0);
         BOOST_LOG_TRIVIAL(info) << "Analog Recorders: " << element.value("analogRecorders", 0);
+        BOOST_LOG_TRIVIAL(info) << "DMR Recorders: " << element.value("dmrRecorders", 0);
         source->create_digital_recorders(tb, digital_recorders);
         source->create_analog_recorders(tb, analog_recorders);
         source->create_sigmf_recorders(tb, sigmf_recorders);
+        source->create_dmr_recorders(tb, dmr_recorders);
         if (config.debug_recorder) {
           source->create_debug_recorder(tb, source_count);
         }

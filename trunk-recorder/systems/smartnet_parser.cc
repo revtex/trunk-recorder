@@ -87,7 +87,6 @@ void SmartnetParser::log_bandplan() {
 }
 
 std::vector<TrunkMessage> SmartnetParser::parse_message(gr::message::sptr msg, System *system) {
-    int sysnum = system->get_sys_num();
     time_t curr_time = time(NULL);
     std::vector<TrunkMessage> messages;
 
@@ -214,8 +213,6 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
              if (osw0.cmd == 0x30b && (osw0.addr & 0xfc00) == 0x6000) {
                  int system = osw2.addr;
                  int site = ((osw1.addr & 0xfc00) >> 10) + 1;
-                 int band = (osw1.addr & 0x380) >> 7;
-                 int feat = (osw1.addr & 0x3f);
                  int cc_rx_chan = osw0.addr & 0x3ff;
                  double cc_rx_freq = get_freq(cc_rx_chan);
                  double cc_tx_freq = osw2.f_tx;
@@ -240,18 +237,23 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
         }
         else if (osw2.ch_tx && osw1.ch_rx && osw1.grp && osw1.addr != 0 && osw2.addr != 0) {
              // Two-OSW group voice grant Line 908
-             int mode = osw2.grp ? 0 : 1; 
+             int mode = osw2.grp ? 0 : 1;
              long src_rid = osw2.addr;
-             long dst_tgid = osw1.addr;
+             // The low 4 bits of the OSW address are the talkgroup status (priority/emergency/
+             // encrypted/patch flags). Strip them before emitting the talkgroup id so downstream
+             // exact-match comparisons (handle_call_grant, find_talkgroup) succeed; decode the
+             // encrypted/emergency flags from the raw address.
+             long raw_addr = osw1.addr;
+             long dst_tgid = raw_addr & 0xfff0;
              double vc_rx_freq = osw1.f_rx;
-             
-             bool encrypted = (dst_tgid & 0x8) >> 3;
-             int options = (dst_tgid & 0x7);
+
+             bool encrypted = (raw_addr & 0x8) >> 3;
+             int options = (raw_addr & 0x7);
              bool emergency = (options == 2 || options == 4 || options == 5);
 
              messages.push_back(create_trunk_message(GRANT, vc_rx_freq * 1000000.0, dst_tgid, src_rid, encrypted, emergency));
-             update_voice_frequency(osw1.ts, vc_rx_freq, dst_tgid, src_rid, mode);
-             
+             update_voice_frequency(osw1.ts, vc_rx_freq, raw_addr, src_rid, mode);
+
              if (this->debug_level >= 11) BOOST_LOG_TRIVIAL(info) << "[" << msgq_id << "] SMARTNET OBT GROUP GRANT src(" << std::dec << src_rid << ") tgid(" << dst_tgid << ") freq(" << vc_rx_freq << ")";
         }
         else if (osw2.ch_tx && osw1.ch_rx && !osw1.grp && osw1.addr != 0 && osw2.addr != 0) {
@@ -270,16 +272,18 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
     }
     // One-OSW voice update Line 952
     else if (osw2.ch_rx && osw2.grp) {
-        long dst_tgid = osw2.addr;
+        // See OBT GROUP GRANT above for why the talkgroup id is masked here.
+        long raw_addr = osw2.addr;
+        long dst_tgid = raw_addr & 0xfff0;
         double vc_freq = osw2.f_rx;
-        
-        bool encrypted = (dst_tgid & 0x8) >> 3;
-        int options = (dst_tgid & 0x7);
+
+        bool encrypted = (raw_addr & 0x8) >> 3;
+        int options = (raw_addr & 0x7);
         bool emergency = (options == 2 || options == 4 || options == 5);
-        
+
         messages.push_back(create_trunk_message(UPDATE, vc_freq * 1000000.0, dst_tgid, 0, encrypted, emergency));
-        update_voice_frequency(osw2.ts, vc_freq, dst_tgid);
-        
+        update_voice_frequency(osw2.ts, vc_freq, raw_addr);
+
         if (this->debug_level >= 11) BOOST_LOG_TRIVIAL(info) << "[" << msgq_id << "] SMARTNET VOICE UPDATE tgid(" << std::dec << dst_tgid << ") freq(" << vc_freq << ")";
     }
     // One-OSW control channel broadcast
@@ -315,16 +319,18 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
         // Two-OSW analog group voice grant line 995
         else if (osw1.ch_rx && osw1.grp && osw1.addr != 0 && osw2.addr != 0) {
             long src_rid = osw2.addr;
-            long dst_tgid = osw1.addr;
+            // See OBT GROUP GRANT above for why the talkgroup id is masked here.
+            long raw_addr = osw1.addr;
+            long dst_tgid = raw_addr & 0xfff0;
             double vc_freq = osw1.f_rx;
-            
-            bool encrypted = (dst_tgid & 0x8) >> 3;
-            int options = (dst_tgid & 0x7);
+
+            bool encrypted = (raw_addr & 0x8) >> 3;
+            int options = (raw_addr & 0x7);
             bool emergency = (options == 2 || options == 4 || options == 5);
 
             messages.push_back(create_trunk_message(GRANT, vc_freq * 1000000.0, dst_tgid, src_rid, encrypted, emergency));
-            update_voice_frequency(osw1.ts, vc_freq, dst_tgid, src_rid, 0);
-            
+            update_voice_frequency(osw1.ts, vc_freq, raw_addr, src_rid, 0);
+
             if (this->debug_level >= 11) BOOST_LOG_TRIVIAL(info) << "[" << msgq_id << "] SMARTNET ANALOG GRANT src(" << std::dec << src_rid << ") tgid(" << dst_tgid << ") freq(" << vc_freq << ")";
         }
         // Two-OSW analog private call voice grant/update (sent for duration of the call)
@@ -426,7 +432,6 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
                     if (this->debug_level >= 11) BOOST_LOG_TRIVIAL(info) << "[" << msgq_id << "] SMARTNET CC2 sys(" << std::hex << this->rx_sys_id << ") freq(" << osw0.f_rx << ")";
                 } else if ((osw1.addr & 0xFC00) == 0x6000) {
                     // System ID + adjacent/alternate control channel broadcast
-                    int site = ((osw1.addr & 0xFC00) >> 10) + 1;
                     int cc_rx_chan = osw1.addr & 0x3ff;
                     double cc_rx_freq = get_freq(cc_rx_chan);
                     double cc_tx_freq = osw2.f_tx;
@@ -708,10 +713,12 @@ std::vector<TrunkMessage> SmartnetParser::process_osws(time_t curr_time) {
         if (osw1.ch_rx && osw2.grp && osw1.grp && (osw1.addr != 0)) {
             // Two-OSW digital group voice grant
             long src_rid = osw2.addr;
-            long dst_tgid = osw1.addr;
+            // See OBT GROUP GRANT above for why the talkgroup id is masked here.
+            long raw_addr = osw1.addr;
+            long dst_tgid = raw_addr & 0xfff0;
             double vc_freq = osw1.f_rx;
-            bool encrypted = (dst_tgid & 0x8) >> 3;
-            int options = (dst_tgid & 0x7);
+            bool encrypted = (raw_addr & 0x8) >> 3;
+            int options = (raw_addr & 0x7);
             bool emergency = (options == 2 || options == 4 || options == 5);
             messages.push_back(create_trunk_message(GRANT, vc_freq * 1000000.0, dst_tgid, src_rid, encrypted, emergency));
 

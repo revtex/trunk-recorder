@@ -1,5 +1,6 @@
 #include "monitor_systems.h"
 #include "recorders/p25_recorder.h"
+#include "systems/dmr_parser.h"
 #include <chrono>
 #include <boost/log/sinks/text_file_backend.hpp>
 #include <boost/log/core.hpp>
@@ -104,6 +105,8 @@ bool start_recorder(Call *call, TrunkMessage message, Config &config, System *sy
         if (talkgroup->mode.compare("A") == 0) {
           recorder = source->get_analog_recorder(talkgroup, priority, call);
           call->set_is_analog(true);
+        } else if (sys->get_system_type() == "dmr") {
+          recorder = source->get_dmr_recorder(talkgroup, priority, call);
         } else {
           recorder = source->get_digital_recorder(talkgroup, priority, call);
         }
@@ -117,6 +120,8 @@ bool start_recorder(Call *call, TrunkMessage message, Config &config, System *sy
         if ((config.default_mode == "analog") && (sys->get_system_type() == "smartnet")) {
           recorder = source->get_analog_recorder(call);
           call->set_is_analog(true);
+        } else if (sys->get_system_type() == "dmr") {
+          recorder = source->get_dmr_recorder(call);
         } else {
           recorder = source->get_digital_recorder(call);
         }
@@ -238,55 +243,47 @@ void print_status(std::vector<Source *> &sources, std::vector<System *> &systems
 }
 
 void manage_conventional_call(Call *call, Config &config) {
+  Recorder *recorder = call->get_recorder();
+  if (!recorder) return;
 
-  if (call->get_recorder()) {
-    // if any recording has happened
+  // All lifecycle queries are slot-aware. For non-DMR recorders the slot
+  // argument is ignored (the base Recorder defaults delegate to the slot-less
+  // method). For DMR this routes to the right transmission_sink so two calls
+  // sharing a recorder don't see each other's idle/length state.
+  int slot = call->get_tdma_slot();
 
-    if (call->get_current_length() > 0) {
+  if (call->get_current_length() > 0) {
+    BOOST_LOG_TRIVIAL(trace) << "[" << call->get_short_name() << "]\t\033[0;34m" << call->get_call_num() << "C\033[0m Call Length: " << call->get_current_length() << "s\t Idle: " << recorder->is_idle(slot) << "\t Squelched: " << recorder->is_squelched() << " Idle Count: " << call->get_idle_count();
 
-      BOOST_LOG_TRIVIAL(trace) << "[" << call->get_short_name() << "]\t\033[0;34m" << call->get_call_num() << "C\033[0m Call Length: " << call->get_current_length() << "s\t Idle: " << call->get_recorder()->is_idle() << "\t Squelched: " << call->get_recorder()->is_squelched() << " Idle Count: " << call->get_idle_count();
-
-      // means that the squelch is on and it has stopped recording
-      if (call->get_recorder()->is_idle()) {
-        // increase the number of periods it has not been recording for
-        call->set_noise(call->get_recorder()->get_pwr());
-        call->increase_idle_count();
-      } else {
-        call->set_signal(call->get_recorder()->get_pwr());
-        if (call->get_idle_count() > 0) {
-          // if it starts recording again, then reset the idle count
-          call->reset_idle_count();
-        }
+    if (recorder->is_idle(slot)) {
+      call->set_noise(recorder->get_pwr());
+      call->increase_idle_count();
+    } else {
+      call->set_signal(recorder->get_pwr());
+      if (call->get_idle_count() > 0) {
+        call->reset_idle_count();
       }
-
-      // if no additional recording has happened in the past X periods, stop and open new file
-      if (call->get_idle_count() > config.call_timeout) {
-        Recorder *recorder = call->get_recorder();
-        call->conclude_call();
-        call->restart_call();
-        if (recorder != NULL) {
-          plugman_setup_recorder(recorder);
-          plugman_call_start(call);
-        }
-      } else if ((call->get_current_length() > call->get_system()->get_max_duration()) && (call->get_system()->get_max_duration() > 0)) {
-        Recorder *recorder = call->get_recorder();
-        call->conclude_call();
-        call->restart_call();
-        if (recorder != NULL) {
-          plugman_setup_recorder(recorder);
-          plugman_call_start(call);
-        }
-      }
-    } else if (!call->get_recorder()->is_active()) {
-      // P25 Conventional and DMR Recorders need a have the graph unlocked before they can start recording.
-      Recorder *recorder = call->get_recorder();
-      recorder->start(call);
-      call->set_state(RECORDING);
-      plugman_call_start(call);
-      BOOST_LOG_TRIVIAL(trace) << "[" << call->get_short_name() << "]\t\033[0;34m" << call->get_call_num() << "C\033[0m Starting P25 Convetional Recorder ";
-
-      // plugman_setup_recorder((Recorder *)recorder->get());
     }
+
+    if (call->get_idle_count() > config.call_timeout) {
+      call->conclude_call();
+      call->restart_call();
+      plugman_setup_recorder(recorder);
+      plugman_call_start(call);
+    } else if ((call->get_current_length() > call->get_system()->get_max_duration()) && (call->get_system()->get_max_duration() > 0)) {
+      call->conclude_call();
+      call->restart_call();
+      plugman_setup_recorder(recorder);
+      plugman_call_start(call);
+    }
+  } else if (!recorder->is_active(slot)) {
+    // Conventional P25 and DMR recorders are started here (not in setup) because
+    // the flowgraph has to be unlocked first. For DMR each slot's call hits
+    // this branch independently and starts only its own slot.
+    recorder->start(call);
+    call->set_state(RECORDING);
+    plugman_call_start(call);
+    BOOST_LOG_TRIVIAL(trace) << "[" << call->get_short_name() << "]\t\033[0;34m" << call->get_call_num() << "C\033[0m Starting Conventional Recorder slot " << slot;
   }
 }
 
@@ -317,9 +314,10 @@ void manage_calls(Config &config, std::vector<Call *> &calls) {
       // Stop the call if:
       // - there hasn't been an UPDATE for it on the Control Channel in X seconds AND the recorder hasn't written anything in X seconds
 
-      if ((recorder->since_last_write() > config.call_timeout) && (call->since_last_update() > config.call_timeout)) {
+      int slot = call->get_tdma_slot();
+      if ((recorder->since_last_write(slot) > config.call_timeout) && (call->since_last_update() > config.call_timeout)) {
         std::string loghdr = log_header( call->get_short_name(), call->get_call_num(), call->get_talkgroup_display(), call->get_freq());
-        BOOST_LOG_TRIVIAL(trace) << loghdr << "\u001b[36m Stopping Call because of Recorder \u001b[0m Rec last write: " << recorder->since_last_write() << " State: " << format_state(recorder->get_state());
+        BOOST_LOG_TRIVIAL(trace) << loghdr << "\u001b[36m Stopping Call because of Recorder \u001b[0m Rec last write: " << recorder->since_last_write(slot) << " State: " << format_state(recorder->get_state(slot));
         call->conclude_call();
         // The State of the Recorders has changed, so lets send an update
         ended_call = true;
@@ -332,8 +330,9 @@ void manage_calls(Config &config, std::vector<Call *> &calls) {
       }
     } else if (call->since_last_update() > config.call_timeout) {
       Recorder *recorder = call->get_recorder();
+      int slot = call->get_tdma_slot();
       std::string loghdr = log_header( call->get_short_name(), call->get_call_num(), call->get_talkgroup_display(), call->get_freq());
-      BOOST_LOG_TRIVIAL(trace) << loghdr << "\u001b[36m  Call UPDATEs has been inactive for more than " << config.call_timeout << " Sec \u001b[0m Rec last write: " << recorder->since_last_write() << " State: " << format_state(recorder->get_state());
+      BOOST_LOG_TRIVIAL(trace) << loghdr << "\u001b[36m  Call UPDATEs has been inactive for more than " << config.call_timeout << " Sec \u001b[0m Rec last write: " << recorder->since_last_write(slot) << " State: " << format_state(recorder->get_state(slot));
     }
     ++it;
   } // foreach loggers
@@ -379,6 +378,10 @@ void unit_data_grant(System *sys, long source_id) {
 
 void unit_answer_request(System *sys, long source_id, long talkgroup) {
   plugman_unit_answer_request(sys, source_id, talkgroup);
+}
+
+void unit_call_alert(System *sys, long source_id, long talkgroup) {
+  plugman_unit_call_alert(sys, source_id, talkgroup);
 }
 
 void unit_location(System *sys, long source_id, long talkgroup_num) {
@@ -674,6 +677,10 @@ void handle_message(std::vector<TrunkMessage> messages, System *sys, Config &con
       unit_answer_request(sys, message.source, message.talkgroup);
       break;
 
+    case CALL_ALERT:
+      unit_call_alert(sys, message.source, message.talkgroup);
+      break;
+
     case INVALID_CC_MESSAGE:
     {
       //Do not count messages that aren't valid TSBK or MBTs.
@@ -710,9 +717,13 @@ void retune_system(System *sys, gr::top_block_sptr &tb, std::vector<Source *> &s
     // For Loop
     if (system->get_system_type() == "smartnet") {
       system->smartnet_trunking->tune_freq(control_channel_freq);
-      //system->smartnet_trunking->reset();
+      // Clear demod tracking state so reacquisition isn't biased by whatever
+      // the loop converged to on the previous (possibly noise-only) channel.
+      system->smartnet_trunking->reset();
     } else if (system->get_system_type() == "p25") {
       system->p25_trunking->tune_freq(control_channel_freq);
+    } else if (system->get_system_type() == "dmr") {
+      system->dmr_trunking->tune_freq(control_channel_freq);
     } else {
       BOOST_LOG_TRIVIAL(error) << "\t - Unknown system type for Retune";
     }
@@ -730,10 +741,13 @@ void retune_system(System *sys, gr::top_block_sptr &tb, std::vector<Source *> &s
           // We must lock the flow graph in order to disconnect and reconnect blocks
           tb->lock();
           tb->disconnect(current_source->get_src_block(), 0, system->smartnet_trunking, 0);
+          // Release the old hier_block2 before constructing the new one so its
+          // sub-blocks (prefilter, fsk2_demod, framer) are torn down deterministically
+          // instead of overlapping with the replacement.
+          system->smartnet_trunking.reset();
           system->smartnet_trunking = smartnet_impl::make(control_channel_freq, source->get_center(), source->get_rate(), system->get_msg_queue(), system->get_sys_num());
           tb->connect(source->get_src_block(), 0, system->smartnet_trunking, 0);
           tb->unlock();
-          //system->smartnet_trunking->reset();
         } else if (system->get_system_type() == "p25") {
           system->set_source(source);
           // We must lock the flow graph in order to disconnect and reconnect blocks
@@ -744,6 +758,14 @@ void retune_system(System *sys, gr::top_block_sptr &tb, std::vector<Source *> &s
           tb->disconnect(current_source->get_src_block(), 0, system->p25_trunking, 0);
           system->p25_trunking = make_p25_trunking(control_channel_freq, source->get_center(), source->get_rate(), system->get_msg_queue(), system->get_qpsk_mod(), system->get_sys_num());
           tb->connect(source->get_src_block(), 0, system->p25_trunking, 0);
+          tb->unlock();
+        } else if (system->get_system_type() == "dmr") {
+          system->set_source(source);
+          tb->lock();
+          tb->disconnect(current_source->get_src_block(), 0, system->dmr_trunking, 0);
+          system->dmr_trunking.reset();
+          system->dmr_trunking = make_dmr_trunking(control_channel_freq, source->get_center(), source->get_rate(), system->get_msg_queue(), system->get_sys_num());
+          tb->connect(source->get_src_block(), 0, system->dmr_trunking, 0);
           tb->unlock();
         } else {
           BOOST_LOG_TRIVIAL(error) << "\t - Unkown system type for Retune";
@@ -858,12 +880,14 @@ int monitor_messages(Config &config, gr::top_block_sptr &tb, std::vector<Source 
   std::vector<TrunkMessage> trunk_messages;
   SmartnetParser *smartnet_parser;
   P25Parser *p25_parser;
+  DmrParser *dmr_parser;
 
   signal(SIGINT, exit_interupt);
   signal(SIGHUP, rotate_log_signal);
 
   smartnet_parser = new SmartnetParser(systems.front()); // this has to eventually be generic;
   p25_parser = new P25Parser();
+  dmr_parser = new DmrParser();
 
   while (1) {
 
@@ -904,7 +928,7 @@ int monitor_messages(Config &config, gr::top_block_sptr &tb, std::vector<Source 
     for (vector<System *>::iterator sys_it = systems.begin(); sys_it != systems.end(); sys_it++) {
       System_impl *system = (System_impl *)*sys_it;
 
-      if ((system->get_system_type() == "p25") || (system->get_system_type() == "smartnet")) {
+      if ((system->get_system_type() == "p25") || (system->get_system_type() == "smartnet") || (system->get_system_type() == "dmr")) {
         msg.reset();
         msg = system->get_msg_queue()->delete_head_nowait();
         while (msg != 0) {
@@ -918,6 +942,12 @@ int monitor_messages(Config &config, gr::top_block_sptr &tb, std::vector<Source 
 
           if (system->get_system_type() == "p25") {
             trunk_messages = p25_parser->parse_message(msg, system);
+            handle_message(trunk_messages, system, config, sources, calls, tb);
+            plugman_trunk_message(trunk_messages, system);
+          }
+
+          if (system->get_system_type() == "dmr") {
+            trunk_messages = dmr_parser->parse_message(msg, system);
             handle_message(trunk_messages, system, config, sources, calls, tb);
             plugman_trunk_message(trunk_messages, system);
           }
