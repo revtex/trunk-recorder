@@ -22,15 +22,19 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <signal.h>
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
 #include <sys/time.h>
+#include <thread>
 #include <time.h>
 #include <unistd.h>
 #include <utility>
@@ -85,6 +89,38 @@ gr::top_block_sptr tb;
 
 Config config;
 
+namespace {
+
+constexpr std::chrono::seconds flowgraph_shutdown_timeout(10);
+
+void stop_flowgraph_or_exit(gr::top_block_sptr &flowgraph, int exit_code) {
+  std::mutex shutdown_mutex;
+  std::condition_variable shutdown_condition;
+  bool shutdown_finished = false;
+
+  std::thread shutdown_watchdog([&shutdown_mutex, &shutdown_condition, &shutdown_finished, exit_code]() {
+    std::unique_lock<std::mutex> lock(shutdown_mutex);
+    if (!shutdown_condition.wait_for(lock, flowgraph_shutdown_timeout, [&shutdown_finished]() { return shutdown_finished; })) {
+      BOOST_LOG_TRIVIAL(fatal) << "Flow graph failed to stop within " << flowgraph_shutdown_timeout.count() << " seconds - forcing process exit";
+      std::_Exit(exit_code);
+    }
+  });
+
+  flowgraph->stop();
+  BOOST_LOG_TRIVIAL(info) << "flow graph stop requested - waiting for worker threads";
+  flowgraph->wait();
+  BOOST_LOG_TRIVIAL(info) << "flow graph stopped";
+
+  {
+    std::lock_guard<std::mutex> lock(shutdown_mutex);
+    shutdown_finished = true;
+  }
+  shutdown_condition.notify_one();
+  shutdown_watchdog.join();
+}
+
+} // namespace
+
 int main(int argc, char **argv) {
   // BOOST_STATIC_ASSERT(true) __attribute__((unused));
   int exit_code = EXIT_SUCCESS;
@@ -133,8 +169,7 @@ int main(int argc, char **argv) {
     // -- stop flow graph execution
     // ------------------------------------------------------------------
     BOOST_LOG_TRIVIAL(info) << "stopping flow graph" << std::endl;
-    tb->stop();
-    tb->wait();
+    stop_flowgraph_or_exit(tb, exit_code);
 
     BOOST_LOG_TRIVIAL(info) << "stopping plugins" << std::endl;
     stop_plugins();
